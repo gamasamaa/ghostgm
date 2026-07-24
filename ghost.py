@@ -28,13 +28,11 @@ config = types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT)
 contents = []
 
 turn = 0
-# Seed the opening turn; subsequent turns are read from stdin.
-next_input = "Begin the session."
 
 while True:
-    if next_input is not None:
-        user_input = next_input
-        next_input = None
+    if turn == 0 and os.path.exists("party.txt"):
+        user_input = open("party.txt").read()
+        print(f"You > [loaded party.txt]")
     else:
         user_input = input("You > ")
         if user_input.strip().lower() in ["exit", "quit"]:

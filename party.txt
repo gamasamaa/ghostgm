@@ -1,0 +1,7 @@
+Party of 4, D&D 5e, level 3:
+- Bram, human fighter. AC 18, HP 31. Longsword +5, 1d8+3.
+- Nix, halfling rogue. AC 15, HP 24. Shortbow +6, 1d6+4. Sneak attack 2d6.
+- Vela, half-elf cleric. AC 16, HP 25. Spell save DC 13. 3x 1st, 2x 2nd.
+- Oro, dwarf wizard. AC 12, HP 20. Spell save DC 14. 4x 1st, 2x 2nd.
+
+We're in the sewers under Waterdeep hunting a cult. Begin the session.
