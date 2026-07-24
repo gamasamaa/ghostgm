@@ -1,0 +1,14 @@
+# Environment and API keys
+.env
+.env.*
+*.key
+*.pem
+
+# Session Transcripts
+transcripts/
+
+# Python / Environment
+venv/
+.venv/
+__pycache__/
+*.pyc
