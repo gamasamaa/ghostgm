@@ -1,0 +1,2 @@
+under baseline phase 0, intake is problematic and clumsy due to lack of staging for the beginning of the session
+struggles with initiative and tracking the turns of each individual characters, treats them as one entity

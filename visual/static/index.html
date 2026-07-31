@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>GhostGM — Visual Tactical Suite</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="app-container">
+    <!-- Header -->
+    <header class="top-header">
+      <div class="brand">
+        <span class="icon">👻</span>
+        <h1>GhostGM <span class="badge">Tactical State Suite</span></h1>
+      </div>
+      <div class="header-actions">
+        <span id="session-tag" class="session-tag">connecting…</span>
+        <button id="btn-reset" class="btn btn-outline" title="Reset the board to full HP and starting positions (the conversation continues)">🔄 Reset Board</button>
+        <div id="connection-status" class="status-indicator online">
+          <span class="dot"></span> Online
+        </div>
+      </div>
+    </header>
+
+    <!-- Main Content Area -->
+    <main class="main-layout">
+      <!-- Left Column: Story Feed & Input -->
+      <section class="feed-section">
+        <div class="panel-header">
+          <h2>📜 Campaign Narrative</h2>
+          <span id="model-tag" class="sub-tag">Gemini 3.5 Flash Lite</span>
+          <span id="turn-stats" class="sub-tag mono"></span>
+        </div>
+
+        <div id="narrative-feed" class="narrative-feed">
+          <div class="msg system-msg">
+            <div class="avatar">🎲</div>
+            <div class="msg-content">
+              <strong>Session Initialized.</strong> Your party roster has been loaded from <code>party.txt</code>. Enter your command below to take action.
+            </div>
+          </div>
+        </div>
+
+        <div class="input-area">
+          <textarea id="user-input" placeholder="Describe your turn (e.g., Bram draws longsword and moves adjacent to the cultist...)" rows="2"></textarea>
+          <button id="btn-send" class="btn btn-primary">
+            Send <span class="send-icon">➔</span>
+          </button>
+        </div>
+      </section>
+
+      <!-- Right Column: State Tracker & Tactical Map -->
+      <section class="tactical-section">
+        <!-- Party & Enemies Roster -->
+        <div class="roster-panel">
+          <div class="panel-header">
+            <h2>🛡️ State Tracker</h2>
+            <span class="sub-tag">Party & Combatants</span>
+          </div>
+
+          <div id="roster-list" class="roster-cards">
+            <!-- Roster cards inserted dynamically via JS -->
+          </div>
+        </div>
+
+        <!-- Tactical Battle Grid Canvas -->
+        <div class="map-panel">
+          <div class="panel-header">
+            <h2>⚔️ Tactical Battle Map</h2>
+            <div class="map-controls">
+              <span class="hint">Click & Drag tokens on grid</span>
+            </div>
+          </div>
+
+          <div class="canvas-wrapper">
+            <canvas id="battle-map" width="600" height="600"></canvas>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

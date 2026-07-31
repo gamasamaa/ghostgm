@@ -1,0 +1,8 @@
+# The ghost itself: CLI + data generation. Nothing here knows about visual/.
+# Direct dependencies only; transitive packages resolve automatically.
+# Versions are the ones this was developed and tested against.
+#   pip install -r requirements.txt
+
+google-genai>=2.14.0    # Gemini client + streaming
+python-dotenv>=1.2.2    # loads GEMINI_API_KEY from .env
+rich>=15.0.0            # display-only coloring (never touches transcript data)
