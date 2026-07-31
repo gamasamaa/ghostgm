@@ -5,11 +5,13 @@ and track state beside it, but it must never change what the GM is asked. The
 fake client asserts the baseline prompt on every call.
 """
 
+import json
 import os
 
 import pytest
 from fakes import FakeClient
 from fastapi.testclient import TestClient
+from support import drain_turn, receive_json
 
 import ghost
 from visual.narration import HPExtractor
@@ -17,6 +19,7 @@ from visual.state import StateManager
 
 PARTY_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "party.txt")
 
+OPENING = "The sewer tunnel drips. Four figures move through the dark."
 REPLY = "Bram swings and the Cultist Leader takes 9 damage. Vela heals Bram for 5."
 
 
@@ -49,7 +52,7 @@ def test_reset_restores_both_sides(board):
 
     assert board.get_token("bram").hp == 31
     assert board.get_token("cultist_1").hp == 22, "enemies reset too, not just the party"
-    assert (board.get_token("bram").x, board.get_token("bram").y) == (2, 4)
+    assert (board.get_token("bram").x, board.get_token("bram").y) == (4, 6)
 
 
 def test_hp_is_clamped(board):
@@ -118,7 +121,9 @@ def app(monkeypatch, tmp_path):
     """The visual app wired to a fake Gemini client and a throwaway transcript dir."""
     import visual.app as va
 
-    fake = FakeClient(chunks=[REPLY[:20], REPLY[20:]], expect_system=ghost.SYSTEM_PROMPT)
+    # Call 1 is the roster turn (scene-setting, no damage); call 2 onward is play.
+    fake = FakeClient(scripts=[[OPENING], [REPLY[:20], REPLY[20:]]],
+                      expect_system=ghost.SYSTEM_PROMPT)
     monkeypatch.setattr(ghost.genai, "Client", fake.factory())
     monkeypatch.setattr(va, "TRANSCRIPT_DIR", str(tmp_path))
     va.sessions.clear()
@@ -135,19 +140,68 @@ def client(app):
 
 @pytest.fixture
 def live(client):
-    """An open socket plus the init payload the server greets it with."""
+    """An open socket, past the init payload and the automatic roster turn."""
     with client.websocket_connect("/ws") as ws:
-        yield ws, ws.receive_json()
+        init = receive_json(ws)
+        drain_turn(ws)  # the GM's opening on party.txt
+        yield ws, init
 
 
 def play_turn(ws, text="Bram attacks the cultist."):
     ws.send_json({"text": text})
-    messages = []
-    while True:
-        message = ws.receive_json()
-        messages.append(message)
-        if message["type"] in ("stream_done", "error"):
-            return messages
+    return drain_turn(ws)
+
+
+# --- the opening roster turn -----------------------------------------------
+
+def test_new_session_opens_on_the_roster(client, app):
+    """Without this the GM invents its own party and the board can never match."""
+    with client.websocket_connect("/ws") as ws:
+        init = receive_json(ws)
+        notice = receive_json(ws)
+        assert notice["type"] == "notice" and "party.txt" in notice["text"]
+
+        messages = drain_turn(ws)
+        assert messages[0]["type"] == "stream_start"
+        assert messages[-1]["type"] == "stream_done"
+        assert messages[-1]["metrics"]["turn"] == 1
+
+    session = app.sessions[init["session_id"]]
+    sent = session.ghost.contents[0].parts[0].text
+    assert "Bram" in sent and "Nix" in sent, "the GM got the actual roster"
+    assert sent == ghost.read_party_file(PARTY_PATH)
+
+
+def test_roster_turn_is_recorded_like_any_other(client, app):
+    with client.websocket_connect("/ws") as ws:
+        init = receive_json(ws)
+        drain_turn(ws)
+
+    session = app.sessions[init["session_id"]]
+    with open(session.ghost.transcript_path, encoding="utf-8") as f:
+        first = json.loads(f.readline())
+    assert first["turn"] == 1
+    assert first["user"] == ghost.read_party_file(PARTY_PATH)
+
+
+def test_player_turns_follow_the_roster(live, app):
+    ws, init = live
+    play_turn(ws)
+    session = app.sessions[init["session_id"]]
+    assert session.ghost.turn == 2, "the roster turn counts, the player's is the second"
+
+
+def test_reconnect_does_not_replay_the_roster(client, app):
+    with client.websocket_connect("/ws") as ws:
+        sid = receive_json(ws)["session_id"]
+        drain_turn(ws)
+
+    with client.websocket_connect(f"/ws?session_id={sid}") as ws:
+        assert receive_json(ws)["session_id"] == sid
+        # No roster turn this time: the next message is only whatever we ask for.
+        play_turn(ws)
+
+    assert app.sessions[sid].ghost.turn == 2, "one roster turn, one player turn"
 
 
 def test_init_carries_session_and_board(live):
@@ -169,7 +223,7 @@ def test_turn_streams_then_finishes(live):
 def test_turn_reports_metrics(live):
     ws, _ = live
     metrics = play_turn(ws)[-1]["metrics"]
-    assert metrics["turn"] == 1
+    assert metrics["turn"] == 2, "turn 1 was the roster"
     assert (metrics["input_tokens"], metrics["output_tokens"]) == (120, 40)
     assert metrics["latency_ms"] >= 0
 
@@ -182,7 +236,7 @@ def test_narration_updates_the_board(live):
         ("Cultist Leader", -9), ("Bram", 5)]
     assert done["state"]["enemies"]["cultist_1"]["hp"] == 13
     assert done["state"]["tokens"]["bram"]["hp"] == 31, "attacking cost Bram nothing"
-    assert done["state"]["turn"] == 1
+    assert done["state"]["turn"] == 2
 
 
 def test_transcript_is_written_by_the_visual_layer(live, app):
@@ -192,7 +246,8 @@ def test_transcript_is_written_by_the_visual_layer(live, app):
     session = app.sessions[init["session_id"]]
     with open(session.ghost.transcript_path, encoding="utf-8") as f:
         lines = [line for line in f if line.strip()]
-    assert len(lines) == 1 and REPLY in lines[0]
+    assert len(lines) == 2, "the roster turn and the player's turn"
+    assert REPLY in lines[1]
 
 
 def test_rest_endpoints_are_scoped_to_a_session(live, client):
@@ -203,7 +258,8 @@ def test_rest_endpoints_are_scoped_to_a_session(live, client):
 
     moved = client.post("/api/token/move",
                         json={"session_id": sid, "token_id": "bram", "x": 99, "y": 3}).json()
-    assert (moved["state"]["tokens"]["bram"]["x"], moved["state"]["tokens"]["bram"]["y"]) == (11, 3)
+    edge = moved["state"]["grid_cols"] - 1
+    assert (moved["state"]["tokens"]["bram"]["x"], moved["state"]["tokens"]["bram"]["y"]) == (edge, 3)
 
     hurt = client.post("/api/token/hp",
                        json={"session_id": sid, "token_id": "bram", "delta": -7}).json()
@@ -234,20 +290,20 @@ def test_reset_restores_the_board_mid_session(live, client):
 
 def test_reconnect_resumes_the_same_session(client, app):
     with client.websocket_connect("/ws") as ws:
-        sid = ws.receive_json()["session_id"]
+        sid = receive_json(ws)["session_id"]
         play_turn(ws)
 
     with client.websocket_connect(f"/ws?session_id={sid}") as ws:
-        assert ws.receive_json()["session_id"] == sid
+        assert receive_json(ws)["session_id"] == sid
 
-    assert len(app.sessions[sid].ghost.contents) == 2, "the conversation survived the reconnect"
+    assert len(app.sessions[sid].ghost.contents) == 4, "roster turn + player turn survived"
     assert len(app.sessions) == 1, "no orphan session was created"
 
 
 def test_clients_get_their_own_boards(client, live):
     _, first = live
     with client.websocket_connect("/ws") as ws:
-        second = ws.receive_json()
+        second = receive_json(ws)
 
     assert second["session_id"] != first["session_id"]
     assert second["state"]["enemies"]["cultist_1"]["hp"] == 22

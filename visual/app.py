@@ -38,6 +38,10 @@ class VisualSession:
         self.ghost = ghost.GhostSession(transcript_dir=TRANSCRIPT_DIR)
         self.state_manager = StateManager(PARTY_PATH)
         self.extractor = HPExtractor(self.state_manager.all_tokens())
+        # The same roster the board is built from, sent to the GM as the opening
+        # turn exactly like ghost.py's CLI does. Without it the GM invents its
+        # own party and nothing on the board can ever match the narration.
+        self.party_text = ghost.read_party_file(PARTY_PATH)
 
     @property
     def id(self):
@@ -130,6 +134,36 @@ async def update_hp(req: HPRequest):
     return {"status": "ok" if updated else "error", "state": session.snapshot()}
 
 
+async def run_turn(websocket, session, user_input):
+    """One exchange: stream the GM's reply, then reconcile the board with it."""
+    await websocket.send_json({"type": "stream_start"})
+
+    async def on_chunk(text):
+        await websocket.send_json({"type": "chunk", "text": text})
+
+    try:
+        record = await session.ghost.send_async(user_input, on_chunk=on_chunk)
+    except Exception as e:
+        await websocket.send_json({"type": "error", "message": str(e)})
+        return None
+
+    applied = session.apply_narration(record["assistant"])
+
+    await websocket.send_json({
+        "type": "stream_done",
+        "state": session.snapshot(),
+        "applied": applied,
+        "metrics": {
+            "turn": record["turn"],
+            "input_tokens": record["input_tokens"],
+            "output_tokens": record["output_tokens"],
+            "latency_ms": record["latency_ms"],
+            "ttft_ms": record["ttft_ms"],
+        },
+    })
+    return record
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket, session_id: str = None):
     await websocket.accept()
@@ -137,7 +171,8 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str = None):
     # Reconnects pass their id back so a dropped socket resumes the same
     # conversation and keeps appending to the same transcript.
     session = sessions.get(session_id)
-    if session is None:
+    is_new = session is None
+    if is_new:
         session = VisualSession()
         sessions[session.id] = session
 
@@ -149,38 +184,22 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str = None):
     })
 
     try:
+        # A fresh session opens on the roster, so the GM and the board are
+        # talking about the same characters. A reconnect must not replay it.
+        if is_new and session.party_text:
+            await websocket.send_json({
+                "type": "notice",
+                "text": f"Loaded {os.path.basename(PARTY_PATH)} — sending the roster to the GM.",
+            })
+            await run_turn(websocket, session, session.party_text)
+
         while True:
             data = await websocket.receive_text()
             msg = json.loads(data)
             user_input = msg.get("text", "").strip()
             if not user_input:
                 continue
-
-            await websocket.send_json({"type": "stream_start"})
-
-            async def on_chunk(text):
-                await websocket.send_json({"type": "chunk", "text": text})
-
-            try:
-                record = await session.ghost.send_async(user_input, on_chunk=on_chunk)
-            except Exception as e:
-                await websocket.send_json({"type": "error", "message": str(e)})
-                continue
-
-            applied = session.apply_narration(record["assistant"])
-
-            await websocket.send_json({
-                "type": "stream_done",
-                "state": session.snapshot(),
-                "applied": applied,
-                "metrics": {
-                    "turn": record["turn"],
-                    "input_tokens": record["input_tokens"],
-                    "output_tokens": record["output_tokens"],
-                    "latency_ms": record["latency_ms"],
-                    "ttft_ms": record["ttft_ms"],
-                },
-            })
+            await run_turn(websocket, session, user_input)
 
     except WebSocketDisconnect:
         pass

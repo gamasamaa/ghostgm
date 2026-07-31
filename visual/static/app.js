@@ -12,12 +12,20 @@ let gameState = {
 let selectedTokenId = null;
 let draggedTokenId = null;
 
+// Measurement state: where the cursor is, and which template is armed.
+let hoverCell = null;
+let templateRadiusFt = 0;
+let showReach = true;
+
+const DEFAULT_SPEED_FT = 30;
+
 // Canvas DOM & Context
 const canvas = document.getElementById("battle-map");
 const ctx = canvas.getContext("2d");
 
 const cellWidth = () => canvas.width / (gameState.grid_cols || 12);
 const cellHeight = () => canvas.height / (gameState.grid_rows || 12);
+const feetPerSquare = () => gameState.feet_per_square || Geometry.DEFAULT_FEET_PER_SQUARE;
 
 // ---------------------------------------------------------------------------
 // WebSocket Connection Management
@@ -71,6 +79,8 @@ function handleServerMessage(data) {
     }
     renderStateLog(data.applied);
     renderMetrics(data.metrics);
+  } else if (data.type === "notice") {
+    createMessageElement("Session", "🎲", "system-msg").textContent = data.text;
   } else if (data.type === "error") {
     activeStreamMsgEl = null;
     createMessageElement("System Error", "⚠️", "system-msg").textContent = `Error: ${data.message}`;
@@ -233,7 +243,15 @@ function renderMap() {
     ctx.stroke();
   }
 
-  // 2. Render Tokens
+  // 2. Measurement overlays, under the tokens so they never hide a piece
+  const selected = allTokens().find((t) => t.id === selectedTokenId);
+  if (selected && showReach) drawReach(selected, cw, ch);
+
+  const blast = currentBlast();
+  if (blast) drawBlast(blast, cw, ch);
+
+  // 3. Render Tokens
+  const caughtIds = new Set(blast ? blast.report.caught.map((t) => t.id) : []);
   allTokens().forEach((token) => {
     const centerX = token.x * cw + cw / 2;
     const centerY = token.y * ch + ch / 2;
@@ -245,6 +263,16 @@ function renderMap() {
       ctx.arc(centerX, centerY, radius + 5, 0, Math.PI * 2);
       ctx.fillStyle = "rgba(255, 255, 255, 0.3)";
       ctx.fill();
+    }
+
+    // Anything inside the armed template gets a ring — allies in warning
+    // amber, so "I'd catch my own fighter" reads at a glance.
+    if (caughtIds.has(token.id)) {
+      ctx.beginPath();
+      ctx.arc(centerX, centerY, radius + 4, 0, Math.PI * 2);
+      ctx.strokeStyle = token.is_enemy ? "#f97316" : "#fbbf24";
+      ctx.lineWidth = 3;
+      ctx.stroke();
     }
 
     // Token Outer Circle
@@ -271,6 +299,81 @@ function renderMap() {
 }
 
 // ---------------------------------------------------------------------------
+// Measurement overlays
+// ---------------------------------------------------------------------------
+// The armed template, centred on whatever square the cursor is over.
+function currentBlast() {
+  if (!templateRadiusFt || !hoverCell) return null;
+  return {
+    center: hoverCell,
+    radiusFt: templateRadiusFt,
+    report: Geometry.blastReport(allTokens(), hoverCell, templateRadiusFt, feetPerSquare()),
+  };
+}
+
+// Movement is Chebyshev, so reach is drawn as a square — not a circle.
+function drawReach(token, cw, ch) {
+  const box = Geometry.reachBox(token, DEFAULT_SPEED_FT, feetPerSquare());
+  ctx.save();
+  ctx.strokeStyle = "rgba(56, 189, 248, 0.45)";
+  ctx.fillStyle = "rgba(56, 189, 248, 0.06)";
+  ctx.lineWidth = 1.5;
+  ctx.setLineDash([6, 4]);
+  const x = box.minX * cw;
+  const y = box.minY * ch;
+  const w = (box.maxX - box.minX + 1) * cw;
+  const h = (box.maxY - box.minY + 1) * ch;
+  ctx.fillRect(x, y, w, h);
+  ctx.strokeRect(x, y, w, h);
+  ctx.restore();
+}
+
+// Areas are Euclidean, so a sphere is drawn as a circle.
+function drawBlast(blast, cw, ch) {
+  const cx = blast.center.x * cw + cw / 2;
+  const cy = blast.center.y * ch + ch / 2;
+  const radiusPx = (blast.radiusFt / feetPerSquare()) * cw;
+  const hitsAlly = blast.report.allies.length > 0;
+
+  ctx.save();
+  ctx.beginPath();
+  ctx.arc(cx, cy, radiusPx, 0, Math.PI * 2);
+  ctx.fillStyle = hitsAlly ? "rgba(251, 191, 36, 0.16)" : "rgba(249, 115, 22, 0.16)";
+  ctx.fill();
+  ctx.strokeStyle = hitsAlly ? "#fbbf24" : "#f97316";
+  ctx.lineWidth = 2;
+  ctx.stroke();
+  ctx.restore();
+}
+
+function renderReadout() {
+  const el = document.getElementById("map-readout");
+  const parts = [];
+  const selected = allTokens().find((t) => t.id === selectedTokenId);
+
+  if (selected && hoverCell) {
+    const ft = Geometry.feetBetween(selected, hoverCell, feetPerSquare());
+    parts.push(`${selected.name} → cursor: ${ft} ft`);
+  } else if (selected) {
+    parts.push(`${selected.name} selected · ${DEFAULT_SPEED_FT} ft reach shown`);
+  } else {
+    parts.push("Select a token to measure from it.");
+  }
+
+  const blast = currentBlast();
+  if (blast) {
+    const { allies, enemies } = blast.report;
+    const names = allies.map((t) => t.name).join(", ");
+    parts.push(
+      `${blast.radiusFt} ft template: ${enemies.length} enemy, ${allies.length} ally` +
+      (allies.length ? ` (${names})` : ""));
+  }
+
+  el.textContent = parts.join("   ·   ");
+  el.classList.toggle("warn", !!(blast && blast.report.allies.length));
+}
+
+// ---------------------------------------------------------------------------
 // Canvas Interaction (Click & Drag to Move Tokens)
 // ---------------------------------------------------------------------------
 // The canvas has a fixed backing size but is laid out by CSS, so pointer
@@ -282,16 +385,31 @@ function cellFromEvent(e) {
   return { col: Math.floor(x / cellWidth()), row: Math.floor(y / cellHeight()) };
 }
 
+canvas.addEventListener("mousemove", (e) => {
+  const { col, row } = cellFromEvent(e);
+  if (hoverCell && hoverCell.x === col && hoverCell.y === row) return;  // same square, no repaint
+  hoverCell = { x: col, y: row };
+  renderMap();
+  renderReadout();
+});
+
+canvas.addEventListener("mouseleave", () => {
+  hoverCell = null;
+  renderMap();
+  renderReadout();
+});
+
 canvas.addEventListener("mousedown", (e) => {
   const { col, row } = cellFromEvent(e);
   const found = allTokens().find((t) => t.x === col && t.y === row);
 
-  if (found) {
-    selectedTokenId = found.id;
-    draggedTokenId = found.id;
-    renderRoster();
-    renderMap();
-  }
+  // Clicking empty ground clears the selection, so the reach box can be
+  // dismissed without moving anything.
+  selectedTokenId = found ? found.id : null;
+  draggedTokenId = found ? found.id : null;
+  renderRoster();
+  renderMap();
+  renderReadout();
 });
 
 canvas.addEventListener("mouseup", async (e) => {
@@ -321,6 +439,21 @@ document.getElementById("user-input").addEventListener("keydown", (e) => {
     e.preventDefault();
     sendMessage();
   }
+});
+
+document.querySelectorAll(".tool-btn").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll(".tool-btn").forEach((b) => b.classList.remove("active"));
+    btn.classList.add("active");
+    templateRadiusFt = Number(btn.dataset.radius);
+    renderMap();
+    renderReadout();
+  });
+});
+
+document.getElementById("show-reach").addEventListener("change", (e) => {
+  showReach = e.target.checked;
+  renderMap();
 });
 
 document.getElementById("btn-reset").addEventListener("click", async () => {

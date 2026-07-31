@@ -29,8 +29,14 @@ class FakeClient:
                     layer that quietly rewrites the baseline prompt fails loudly
     """
 
-    def __init__(self, chunks=None, usage=None, fail_times=0, expect_system=None):
-        self.chunks = list(DEFAULT_CHUNKS if chunks is None else chunks)
+    def __init__(self, chunks=None, scripts=None, usage=None, fail_times=0, expect_system=None):
+        # `scripts` gives a different reply per call (call N uses scripts[N-1],
+        # the last one repeating) — needed once a session opens on the roster
+        # and the opening shouldn't say the same thing as a combat turn.
+        if scripts is not None:
+            self.scripts = [list(s) for s in scripts]
+        else:
+            self.scripts = [list(DEFAULT_CHUNKS if chunks is None else chunks)]
         self.usage = usage or Usage()
         self.fail_times = fail_times
         self.expect_system = expect_system
@@ -52,7 +58,8 @@ class FakeClient:
             raise RuntimeError("503 overloaded")
 
     def _stream(self):
-        return [Chunk(c) for c in self.chunks] + [Chunk("", self.usage)]
+        script = self.scripts[min(len(self.calls) - 1, len(self.scripts) - 1)]
+        return [Chunk(c) for c in script] + [Chunk("", self.usage)]
 
 
 class _SyncModels:

@@ -35,8 +35,12 @@ class Token(BaseModel):
 
 
 class GameState(BaseModel):
-    grid_cols: int = 12
-    grid_rows: int = 12
+    # 20x20 at 5 ft is a 100 ft room. On the old 12x12 (60 ft) a fireball's
+    # 20 ft radius covered most of the board, which makes placing one a
+    # non-decision — the whole point of the template tool is the trade-off.
+    grid_cols: int = 20
+    grid_rows: int = 20
+    feet_per_square: int = 5
     party_location: str = "Unknown Location"
     tokens: Dict[str, Token] = {}
     enemies: Dict[str, Token] = {}
@@ -60,8 +64,8 @@ def party_tokens(party_text: Optional[str]) -> List[Token]:
                 ac=member["ac"] if member["ac"] is not None else DEFAULT_AC,
                 hp=hp,
                 max_hp=hp,
-                x=2,
-                y=4 + i * 2,
+                x=4,
+                y=6 + i * 2,
                 color=PLAYER_COLORS[i % len(PLAYER_COLORS)],
                 is_enemy=False,
             )
@@ -73,9 +77,9 @@ def demo_enemies() -> List[Token]:
     """Placeholder opposition until enemies can be added at runtime."""
     return [
         Token(id="cultist_1", name="Cultist Leader", class_info="Fanatic",
-              ac=13, hp=22, max_hp=22, x=8, y=5, color=ENEMY_COLOR, is_enemy=True),
+              ac=13, hp=22, max_hp=22, x=14, y=8, color=ENEMY_COLOR, is_enemy=True),
         Token(id="cultist_2", name="Sewer Cultist", class_info="Initiate",
-              ac=11, hp=12, max_hp=12, x=8, y=7, color=ENEMY_COLOR, is_enemy=True),
+              ac=11, hp=12, max_hp=12, x=14, y=10, color=ENEMY_COLOR, is_enemy=True),
     ]
 
 

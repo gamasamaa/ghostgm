@@ -40,7 +40,7 @@
           <div class="msg system-msg">
             <div class="avatar">🎲</div>
             <div class="msg-content">
-              <strong>Session Initialized.</strong> Your party roster has been loaded from <code>party.txt</code>. Enter your command below to take action.
+              <strong>Connecting…</strong> The GM opens on the roster in <code>party.txt</code>; take it from there.
             </div>
           </div>
         </div>
@@ -72,18 +72,33 @@
           <div class="panel-header">
             <h2>⚔️ Tactical Battle Map</h2>
             <div class="map-controls">
-              <span class="hint">Click & Drag tokens on grid</span>
+              <span class="hint">Drag tokens · click to measure from</span>
             </div>
           </div>
 
+          <div class="map-toolbar">
+            <span class="tool-label">Template</span>
+            <button class="tool-btn active" data-radius="0">Off</button>
+            <button class="tool-btn" data-radius="10">10 ft</button>
+            <button class="tool-btn" data-radius="15">15 ft</button>
+            <button class="tool-btn" data-radius="20">20 ft</button>
+            <button class="tool-btn" data-radius="30">30 ft</button>
+            <label class="tool-toggle">
+              <input type="checkbox" id="show-reach" checked> Reach
+            </label>
+          </div>
+
+          <div id="map-readout" class="map-readout">Select a token to measure from it.</div>
+
           <div class="canvas-wrapper">
-            <canvas id="battle-map" width="600" height="600"></canvas>
+            <canvas id="battle-map" width="800" height="800"></canvas>
           </div>
         </div>
       </section>
     </main>
   </div>
 
+  <script src="/static/geometry.js"></script>
   <script src="/static/app.js"></script>
 </body>
 </html>
