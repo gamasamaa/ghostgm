@@ -28,10 +28,8 @@ claude-transcripts/
 claude-failures.md
 run_claude_session.py
 
-# Local sqlite artifacts. The store itself lives on the db branch, but the file
-# it writes sits in the shared working tree and shows up on whatever branch is
-# checked out — so the rule belongs here too, or a binary turns up untracked in
-# every `git status` run from main.
+# Derived store. Rebuildable from transcripts/ by re-ingesting; never the
+# source of truth for anything.
 data/
 *.db
 *.db-wal
