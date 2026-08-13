@@ -6,13 +6,19 @@ to produce.
 """
 
 import asyncio
+import io
 import json
 import os
+import shutil
+import sys
 
 import httpx
 import pytest
 from fakes import DEFAULT_CHUNKS, FakeClient, Usage
 from google.genai import errors as genai_errors
+from rich.ansi import AnsiDecoder
+from rich.console import Console
+from rich.style import Style
 
 import ghost
 
@@ -241,6 +247,130 @@ def test_the_convention_is_never_explained_to_the_model():
 
     for leak in ("name: action", "speak as", "prefix", "attributable", "initiative"):
         assert leak not in text, f"party.txt now coaches the GM: {leak!r}"
+
+
+# ---------------------------------------------------------------------------
+# Turn tally
+#
+# failures.md lines are `s<session_id>/t<turn>`, so the CLI has to show the turn
+# number while the turn is on screen. These drive the real `main()` and decode
+# the ANSI back out, because "it stands out" is a claim about what the terminal
+# actually paints, not about what the source says.
+# ---------------------------------------------------------------------------
+
+def run_cli(tmp_path, monkeypatch, typed, scripts=None, **fake_kwargs):
+    """Play a whole CLI session; return (what the terminal showed, transcript).
+
+    force_terminal, because rich strips styling when it isn't writing to a TTY
+    and the tally would then be indistinguishable from surrounding text.
+    """
+    monkeypatch.chdir(tmp_path)  # party.txt and transcripts/ are relative paths
+    shutil.copy(PARTY_PATH, tmp_path / "party.txt")
+
+    fake = FakeClient(scripts=scripts or [["Scene set."], ["The GM replies."]],
+                      **fake_kwargs)
+    monkeypatch.setattr(ghost.genai, "Client", fake.factory())
+    monkeypatch.setattr(sys, "stdin", io.StringIO("\n".join(typed + ["exit"]) + "\n"))
+
+    screen = io.StringIO()
+    monkeypatch.setattr(ghost, "console", Console(
+        highlight=False, soft_wrap=True, force_terminal=True, width=100, file=screen))
+
+    ghost.main()
+
+    written = list((tmp_path / "transcripts").glob("*.jsonl"))
+    assert len(written) == 1
+    with open(written[0], encoding="utf-8") as f:
+        return screen.getvalue(), [json.loads(line) for line in f if line.strip()]
+
+
+def highlighted(screen):
+    """Every run of text the terminal would paint on a background colour.
+
+    The tally is the only thing that gets a background, so this doubles as the
+    bleed check: a style set on a Text rather than an appended span survives
+    concatenation, which silently paints the prompt and the GM label too.
+    """
+    runs = []
+    for line in AnsiDecoder().decode(screen):
+        for span in line.spans:
+            if span.style.bgcolor is not None:
+                runs.append(line.plain[span.start:span.end])
+    return runs
+
+
+def test_the_tally_names_the_turn_the_record_will_carry(tmp_path, monkeypatch):
+    screen, records = run_cli(tmp_path, monkeypatch, ["Bram: I attack", "Nix: I hide"])
+
+    # Turn 1 is the roster. Each turn is tagged twice — once on the prompt, once
+    # on the GM's reply — so the number is on screen whichever half you're
+    # reading when the failure shows up.
+    assert [r["turn"] for r in records] == [1, 2, 3]
+    assert highlighted(screen) == [
+        " t1 ", " t1 ",   # roster
+        " t2 ", " t2 ",
+        " t3 ", " t3 ",
+        " t4 ",           # the prompt that was answered with "exit"
+        " 3 turns ",      # sign-off tally
+    ]
+
+
+def test_the_tally_stands_out_from_every_other_speaker(tmp_path, monkeypatch):
+    """A colour already used by the GM or a party member wouldn't be findable."""
+    taken = {ghost.GM_STYLE, ghost.YOU_STYLE, ghost.WARN_STYLE, *ghost.PLAYER_PALETTE}
+    assert ghost.TURN_STYLE not in taken
+
+    tally = Style.parse(ghost.TURN_STYLE)
+    assert tally.bgcolor is not None, "a foreground colour alone doesn't stand out"
+    for other in taken:
+        assert Style.parse(other).color != tally.color or Style.parse(other).bgcolor
+
+
+def test_a_failed_turn_does_not_advance_the_tally(tmp_path, monkeypatch):
+    """Nothing was committed, so the number is still free — and must be reused.
+
+    Otherwise the tally drifts ahead of the transcript and every failures.md
+    line written after the first outage points at the wrong record.
+    """
+    # A 400 is not transient, so it raises without spending retries; the CLI
+    # then offers the same turn again. FakeClient fails the first N calls, so
+    # it's the roster turn that dies here and gets replayed by hand.
+    bad_request = genai_errors.ClientError(400, {"error": {"message": "nope"}})
+    screen, records = run_cli(
+        tmp_path, monkeypatch,
+        # The two blanks answer "Press Enter to retry the same turn".
+        ["", "", "Bram: I attack"],
+        scripts=[["Scene set."], ["Recovered."]],
+        fail_times=2, error=bad_request)
+
+    assert [r["turn"] for r in records] == [1, 2]
+    assert highlighted(screen) == [
+        " t1 ", " t1 ",   # roster: the prompt, then the reply that 400'd
+        " t1 ",           # replay — no prompt, nothing was retyped, still turn 1
+        " t1 ",           # replay again, and this one lands
+        " t2 ", " t2 ",
+        " t3 ",           # the next free number, at the prompt "exit" answered
+        " 2 turns ",
+    ]
+
+
+def test_the_tally_never_reaches_the_transcript(tmp_path, monkeypatch):
+    """Display only — the same rule the colouring follows."""
+    _, records = run_cli(tmp_path, monkeypatch, ["Bram: I attack"])
+
+    for record in records:
+        blob = record["user"] + record["assistant"]
+        assert "\x1b" not in blob
+        assert f" t{record['turn']} " not in blob
+
+
+def test_the_sign_off_counts_recorded_turns_against_the_target(tmp_path, monkeypatch):
+    """A session that came up short should say so before you close the window."""
+    screen, records = run_cli(tmp_path, monkeypatch, ["Bram: I attack"])
+
+    plain = "".join(line.plain for line in AnsiDecoder().decode(screen))
+    assert f" {len(records)} turns " in plain
+    assert f"{ghost.SESSION_TURN_TARGET - len(records)} turns short" in plain
 
 
 # ---------------------------------------------------------------------------

@@ -267,8 +267,31 @@ console = Console(highlight=False, soft_wrap=True)
 GM_STYLE = "bold magenta"
 YOU_STYLE = "bold white"
 WARN_STYLE = "yellow"
+# Reversed rather than colored: every foreground color is already spoken for by
+# the GM, a party member or a warning, and the tally has to stay findable when
+# you scroll back through a 30-turn session looking for one turn.
+TURN_STYLE = "bold black on white"
 # Reserved for the GM: magenta. Players draw from here, in party.txt order.
 PLAYER_PALETTE = ["cyan", "green", "yellow", "blue", "red", "bright_cyan", "bright_green"]
+
+# What the roadmap asks of one baseline session. Display only — nothing enforces
+# it, it just saves counting transcript lines to find out where you stand.
+SESSION_TURN_TARGET = 30
+
+
+def turn_tag(n):
+    """The turn number a record will carry, as a display label.
+
+    failures.md lines are written `s<session_id>/t<turn>`, so this is the `t`
+    half, readable at the moment the failure happens instead of reconstructed
+    from the transcript afterwards.
+
+    The style goes on an appended span, not on the Text itself: a base style
+    survives concatenation and would tint everything printed after the tag.
+    """
+    tag = Text()
+    tag.append(f" t{n} ", style=TURN_STYLE)
+    return tag
 
 
 def speaker_of(user_input, names):
@@ -285,6 +308,22 @@ def speaker_of(user_input, names):
     if not sep:
         return None
     return head.strip() if head.strip() in names else None
+
+
+def farewell(session):
+    """Sign-off: where the transcript went, and how the count landed."""
+    line = Text()
+    line.append("Ending session —", style="dim")
+    line.append(f" {session.turn} turns ", style=TURN_STYLE)
+    line.append(f" recorded to {session.transcript_path}.", style="dim")
+    console.print(line)
+
+    short = SESSION_TURN_TARGET - session.turn
+    if short > 0:
+        console.print(Text(
+            f"{short} turn{'s' if short != 1 else ''} short of the "
+            f"{SESSION_TURN_TARGET}-turn target for a baseline session.",
+            style=WARN_STYLE))
 
 
 def build_name_pattern(player_styles):
@@ -342,22 +381,25 @@ def main():
     pending_input = None
 
     while True:
+        # The turn this exchange will be recorded as. A failed turn is never
+        # committed, so the number is still free on the next pass — the tally
+        # counts what reached the transcript, not what was attempted.
+        turn_no = session.turn + 1
+        prompt = turn_tag(turn_no) + Text(" " + prompt_label, style=YOU_STYLE)
+
         if pending_input is not None:
             user_input, pending_input = pending_input, None
         elif session.turn == 0 and party_text is not None:
             user_input = party_text
-            console.print(Text(prompt_label, style=YOU_STYLE) + Text(f"[loaded {PARTY_FILE}]", style="dim"))
+            console.print(prompt + Text(f"[loaded {PARTY_FILE}]", style="dim"))
         else:
             try:
-                user_input = console.input(Text(prompt_label, style=YOU_STYLE))
+                user_input = console.input(prompt)
             except (EOFError, KeyboardInterrupt):
                 console.print()
                 user_input = "exit"
             if user_input.strip().lower() in ["exit", "quit"]:
-                console.print(
-                    f"Ending session. Transcript saved to {session.transcript_path}. Farewell!",
-                    style="dim",
-                )
+                farewell(session)
                 break
             # Warn, don't block: the turn goes to the model exactly as typed.
             if player_styles and speaker_of(user_input, player_styles) is None:
@@ -367,7 +409,7 @@ def main():
 
         console.print()
         console.print(Text("[Sending prompt to GM...]", style="dim"))
-        console.print(Text("GM > ", style=GM_STYLE), end="")
+        console.print(turn_tag(turn_no) + Text(" GM > ", style=GM_STYLE), end="")
 
         # Display buffer: holds back the trailing partial word so a character
         # name split across two stream chunks still gets matched as one name.
@@ -389,7 +431,8 @@ def main():
             console.print(
                 Text(f"\n[retry {attempt}/{session.max_attempts - 1}: {error} "
                      f"— discarding the above, restarting the reply]", style=WARN_STYLE))
-            console.print(Text("GM > ", style=GM_STYLE), end="")
+            # Same request re-issued, so it is still the same turn number.
+            console.print(turn_tag(turn_no) + Text(" GM > ", style=GM_STYLE), end="")
 
         try:
             session.send(user_input, on_chunk=on_chunk, on_retry=on_retry)
@@ -406,10 +449,7 @@ def main():
                 console.input(Text("Press Enter to retry the same turn...", style="dim"))
             except (EOFError, KeyboardInterrupt):
                 console.print()
-                console.print(
-                    f"Ending session. Transcript saved to {session.transcript_path}. Farewell!",
-                    style="dim",
-                )
+                farewell(session)
                 break
             continue
 

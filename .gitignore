@@ -6,8 +6,11 @@ GHOSTGM_ROADMAP.md
 .env.*
 *.key
 *.pem
+# A committed template is the point of it, so keep it out of the glob above.
+!.env.example
 
-# Session Transcripts
+# Session Transcripts. Raw play data — the input to phase 2's golden set, which
+# does get committed, under evals/.
 transcripts/
 
 # Python / Environment
@@ -15,3 +18,14 @@ venv/
 .venv/
 __pycache__/
 *.pyc
+
+# pytest writes a .gitignore inside its own cache, so this is already covered
+# until that file is cleaned away. Say it here so it doesn't depend on that.
+.pytest_cache/
+
+# macOS
+.DS_Store
+
+# Per-machine editor/agent settings. Currently only ignored by this machine's
+# global gitconfig, which doesn't travel with a clone.
+.claude/settings.local.json
