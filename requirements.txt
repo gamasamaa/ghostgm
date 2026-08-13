@@ -4,5 +4,6 @@
 #   pip install -r requirements.txt
 
 google-genai>=2.14.0    # Gemini client + streaming
+httpx>=0.28.1           # named directly: retry classifies its transport errors
 python-dotenv>=1.2.2    # loads GEMINI_API_KEY from .env
 rich>=15.0.0            # display-only coloring (never touches transcript data)

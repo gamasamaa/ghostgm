@@ -141,8 +141,19 @@ async def run_turn(websocket, session, user_input):
     async def on_chunk(text):
         await websocket.send_json({"type": "chunk", "text": text})
 
+    async def on_retry(attempt, error, partial):
+        # The browser has already rendered `partial`; the retry replaces the
+        # reply rather than continuing it, so tell it to clear.
+        await websocket.send_json({
+            "type": "stream_retry",
+            "attempt": attempt,
+            "of": session.ghost.max_attempts - 1,
+            "message": str(error),
+        })
+
     try:
-        record = await session.ghost.send_async(user_input, on_chunk=on_chunk)
+        record = await session.ghost.send_async(
+            user_input, on_chunk=on_chunk, on_retry=on_retry)
     except Exception as e:
         await websocket.send_json({"type": "error", "message": str(e)})
         return None

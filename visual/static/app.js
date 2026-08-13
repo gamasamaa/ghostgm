@@ -70,6 +70,14 @@ function handleServerMessage(data) {
       const feed = document.getElementById("narrative-feed");
       feed.scrollTop = feed.scrollHeight;
     }
+  } else if (data.type === "stream_retry") {
+    // The attempt was abandoned mid-reply. Drop its bubble entirely — keeping
+    // the text would leave a half-narration the GM never finished — then open a
+    // fresh one below the notice so the restarted reply reads in order.
+    if (activeStreamMsgEl) activeStreamMsgEl.closest(".msg").remove();
+    createMessageElement("Session", "🎲", "system-msg").textContent =
+      `Retry ${data.attempt}/${data.of}: ${data.message} — restarting the reply.`;
+    activeStreamMsgEl = createMessageElement("GM", "🧙‍♂️", "gm-msg");
   } else if (data.type === "stream_done") {
     activeStreamMsgEl = null;
     if (data.state) {

@@ -24,8 +24,8 @@ import ghost
 VOLATILE = {"session_id", "ts", "latency_ms", "ttft_ms"}
 
 PLAYER_INPUTS = [
-    "Bram attacks the cultist leader.",
-    "Nix looks for a way around the flank.",
+    "Bram: I attack the cultist leader.",
+    "Nix: I look for a way around the flank.",
 ]
 
 SCRIPTS = [
