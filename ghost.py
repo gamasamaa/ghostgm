@@ -43,9 +43,102 @@ BACKOFF_BASE_S = 1.0
 BACKOFF_CAP_S = 20.0
 
 
+# A per-minute limit routinely asks for longer than BACKOFF_CAP_S, so the wait
+# google names is honoured over our own. Capped just past a one-minute window:
+# anything asking for longer is not a burst limit and should surface instead of
+# silently parking the session.
+RETRY_AFTER_CAP_S = 65.0
+
+# ---------------------------------------------------------------------------
+# Free-tier quota
+#
+# A free-tier key hits two different 429s that need opposite handling. A
+# per-minute rate limit clears itself within the minute, so it is worth waiting
+# out. A spent daily allowance does not clear until google's quota window rolls
+# over, so retrying only burns the backoff budget and then reports a timeout —
+# which says nothing about why the session actually stopped.
+#
+# Both arrive as 429 RESOURCE_EXHAUSTED. What separates them is the QuotaFailure
+# violation google attaches to the response body.
+# ---------------------------------------------------------------------------
+
+QUOTA_STATUS = "RESOURCE_EXHAUSTED"
+# Google's naming for the daily buckets, e.g. the free tier's
+# "GenerateRequestsPerDayPerProjectPerModel-FreeTier".
+DAILY_QUOTA_MARKERS = ("perday", "per_day")
+
+
+def _error_body(exc):
+    """The `error` object off an APIError, or {}.
+
+    `details` is whatever JSON came back, so nothing here may assume a shape —
+    a parser that raises while explaining a failure is worse than no parser.
+    """
+    details = getattr(exc, "details", None)
+    if not isinstance(details, dict):
+        return {}
+    body = details.get("error", details)
+    return body if isinstance(body, dict) else {}
+
+
+def _detail_entries(exc, type_suffix):
+    """google.rpc detail entries of one type, e.g. "QuotaFailure"."""
+    entries = _error_body(exc).get("details")
+    if not isinstance(entries, list):
+        return []
+    return [e for e in entries
+            if isinstance(e, dict) and str(e.get("@type", "")).endswith(type_suffix)]
+
+
+def quota_violations(exc):
+    """Which allowances the request blew, as google reported them."""
+    found = []
+    for entry in _detail_entries(exc, "QuotaFailure"):
+        violations = entry.get("violations")
+        if isinstance(violations, list):
+            found.extend(v for v in violations if isinstance(v, dict))
+    return found
+
+
+def is_quota_error(exc):
+    """True for any 'you have used your allowance' refusal, daily or per-minute."""
+    return isinstance(exc, genai_errors.APIError) and (
+        exc.code == 429 or exc.status == QUOTA_STATUS)
+
+
+def is_quota_exhausted(exc):
+    """True when the allowance is spent for the day, not just for the minute.
+
+    Deliberately conservative: an unrecognised 429 is treated as a burst limit
+    and retried, because waiting is cheap and wrongly declaring a session over
+    is not.
+    """
+    if not is_quota_error(exc):
+        return False
+    for violation in quota_violations(exc):
+        name = f"{violation.get('quotaId', '')} {violation.get('quotaMetric', '')}".lower()
+        if any(marker in name for marker in DAILY_QUOTA_MARKERS):
+            return True
+    return False
+
+
+def retry_after(exc):
+    """The wait google asked for in seconds, or None if it didn't say."""
+    for entry in _detail_entries(exc, "RetryInfo"):
+        match = re.fullmatch(r"(\d+(?:\.\d+)?)s", str(entry.get("retryDelay", "")).strip())
+        if match:
+            return float(match.group(1))
+    return None
+
+
 def is_transient(exc):
     """True when re-issuing the same request could plausibly succeed."""
     if isinstance(exc, genai_errors.APIError):
+        # 429 is in RETRYABLE_STATUS for the per-minute case. A spent daily
+        # allowance is the one 429 that no amount of waiting inside a session
+        # will clear, so it surfaces immediately with an explanation.
+        if is_quota_exhausted(exc):
+            return False
         return exc.code in RETRYABLE_STATUS
     # Never reached the model, or died on the way back: reset connection, DNS
     # blip, read timeout. httpx.TransportError covers the family; the builtins
@@ -223,7 +316,15 @@ class GhostSession:
         """Seconds to wait before re-issuing, or None to give up and raise."""
         if attempt >= self.max_attempts or not is_transient(exc):
             return None
-        return backoff_delay(attempt, self._rand)
+
+        jitter = backoff_delay(attempt, self._rand)
+        asked = retry_after(exc)
+        if asked is None:
+            return jitter
+        # Google named a number. Wait at least that long — our own cap is
+        # shorter than a per-minute window, so ignoring it would retry into the
+        # same closed door three times and call the session dead.
+        return min(asked + jitter, RETRY_AFTER_CAP_S)
 
     def _begin(self, user_input):
         self.contents.append(types.Content(role="user", parts=[types.Part.from_text(text=user_input)]))
@@ -324,6 +425,57 @@ def farewell(session):
             f"{short} turn{'s' if short != 1 else ''} short of the "
             f"{SESSION_TURN_TARGET}-turn target for a baseline session.",
             style=WARN_STYLE))
+
+
+def describe(exc):
+    """A one-line reason. APIError stringifies to the whole response body, which
+    on a 429 is a wall of JSON that buries the one word that matters."""
+    if is_quota_error(exc):
+        which = "daily allowance spent" if is_quota_exhausted(exc) else "rate limited"
+        return f"google says {which}"
+    if isinstance(exc, genai_errors.APIError):
+        return f"google returned {exc.code} {exc.status or ''}".strip()
+    return f"{type(exc).__name__}: {exc}"
+
+
+def report_quota_block(exc, session):
+    """Say plainly that google stopped the session, not that the code broke.
+
+    A spent allowance surfaces as a 429 carrying a wall of JSON. Printed raw it
+    reads like a bug in the session, and the first instinct is to retry — which
+    is exactly wrong for the daily cap. So it gets its own message, and the
+    daily case says outright that waiting is the only fix.
+    """
+    exhausted = is_quota_exhausted(exc)
+    headline = ("free-tier daily allowance is spent" if exhausted
+                else "rate limit did not clear")
+    console.print(Text(f"[Google is refusing this key — {headline}]", style="bold red"))
+
+    for violation in quota_violations(exc):
+        name = violation.get("quotaId") or violation.get("quotaMetric") or "quota"
+        limit = violation.get("quotaValue")
+        console.print(Text(f"  {name}" + (f" = {limit}" if limit else ""), style="dim"))
+
+    if exhausted:
+        console.print(Text(
+            "  Retrying will not clear this. Free-tier daily quotas reset on "
+            "google's clock, not yours — usually midnight Pacific.", style="dim"))
+    else:
+        console.print(Text(
+            f"  {session.max_attempts} attempts, all refused. Either the burst "
+            "limit is still closed or this is a daily cap google didn't label.",
+            style="dim"))
+
+    # The turn that failed was never committed, so the count is what is on disk.
+    # Losing a long session is the fear a quota wall triggers; answer it here.
+    if session.turn:
+        console.print(Text(
+            f"  {session.turn} turns are already saved to {session.transcript_path} "
+            "— nothing is lost.", style="dim"))
+    else:
+        console.print(Text(
+            f"  Nothing recorded yet. The transcript is {session.transcript_path}.",
+            style="dim"))
 
 
 def build_name_pattern(player_styles):
@@ -428,9 +580,12 @@ def main():
             # unprinted, so say plainly that what follows replaces it.
             nonlocal pending
             pending = ""
+            waiting = retry_after(error)
+            waited = f", waiting {waiting:.0f}s as asked" if waiting else ""
             console.print(
-                Text(f"\n[retry {attempt}/{session.max_attempts - 1}: {error} "
-                     f"— discarding the above, restarting the reply]", style=WARN_STYLE))
+                Text(f"\n[retry {attempt}/{session.max_attempts - 1}: {describe(error)}"
+                     f"{waited} — discarding the above, restarting the reply]",
+                     style=WARN_STYLE))
             # Same request re-issued, so it is still the same turn number.
             console.print(turn_tag(turn_no) + Text(" GM > ", style=GM_STYLE), end="")
 
@@ -441,12 +596,23 @@ def main():
         except Exception as e:
             if pending:
                 console.print(colorize(pending, name_pattern, player_styles), end="")
+            console.print()
             # Automated retries are spent (or the failure was never transient),
             # so the last resort is a human deciding to try again.
-            console.print(Text(f"\n[Error during generation: {e}]", style="bold red"))
+            if is_quota_error(e):
+                report_quota_block(e, session)
+            else:
+                console.print(Text(f"[Error during generation: {e}]", style="bold red"))
+
+            # Offered even when the quota is spent: the history only lives in
+            # this process, so ending a 40-turn session to wait out a reset
+            # throws away the conversation. Staying open costs nothing.
+            hint = ("Press Enter to try this turn again, or Ctrl-D to end the session..."
+                    if is_quota_error(e) else
+                    "Press Enter to retry the same turn...")
             pending_input = user_input  # replay the same turn on the next iteration
             try:
-                console.input(Text("Press Enter to retry the same turn...", style="dim"))
+                console.input(Text(hint, style="dim"))
             except (EOFError, KeyboardInterrupt):
                 console.print()
                 farewell(session)

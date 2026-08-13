@@ -14,7 +14,7 @@ import sys
 
 import httpx
 import pytest
-from fakes import DEFAULT_CHUNKS, FakeClient, Usage
+from fakes import DEFAULT_CHUNKS, FakeClient, Usage, quota_exceeded
 from google.genai import errors as genai_errors
 from rich.ansi import AnsiDecoder
 from rich.console import Console
@@ -198,6 +198,137 @@ def test_session_sleeps_with_growing_delays(tmp_path):
 ])
 def test_transient_classification(exc, retried):
     assert ghost.is_transient(exc) is retried
+
+
+# ---------------------------------------------------------------------------
+# Free-tier quota
+#
+# The two 429s a free-tier key produces are the same status, the same status
+# string and the same message. Everything here turns on reading the quotaId,
+# because getting it wrong means either burning the backoff budget on a wall
+# that won't move, or declaring a session over when it would have resumed.
+# ---------------------------------------------------------------------------
+
+def test_daily_exhaustion_is_not_retried(tmp_path):
+    """Four attempts over 35 seconds cannot outlast a quota that resets at midnight."""
+    client = FakeClient(fail_times=99, error=quota_exceeded(daily=True))
+    session, slept = build(tmp_path, client)
+
+    with pytest.raises(genai_errors.ClientError):
+        session.send("Bram: I attack")
+
+    assert len(client.calls) == 1, "waiting cannot clear a spent daily allowance"
+    assert slept == []
+
+
+def test_per_minute_limit_is_still_retried(tmp_path):
+    """The burst limit clears itself, so it is worth waiting out."""
+    client = FakeClient(fail_times=2, error=quota_exceeded(daily=False))
+    session, _ = build(tmp_path, client)
+
+    assert session.send("Bram: I attack")["turn"] == 1
+    assert len(client.calls) == 3
+
+
+def test_google_s_own_retry_delay_wins_over_our_backoff(tmp_path):
+    """A per-minute window is longer than BACKOFF_CAP_S.
+
+    Retrying on our own schedule would hit the same closed door three times in
+    35 seconds and call the session dead, on a limit that clears in under one.
+    """
+    client = FakeClient(fail_times=2, error=quota_exceeded(daily=False, retry_delay="27s"))
+    session, slept = build(tmp_path, client)
+    session.send("Bram: I attack")
+
+    # 27s asked, plus the jittered backoff (rand is pinned to 1.0 in build()).
+    assert slept == [27.0 + 1.0, 27.0 + 2.0]
+    assert all(s > ghost.BACKOFF_CAP_S for s in slept)
+
+
+def test_an_absurd_retry_delay_cannot_park_the_session(tmp_path):
+    client = FakeClient(fail_times=1, error=quota_exceeded(daily=False, retry_delay="86400s"))
+    session, slept = build(tmp_path, client)
+    session.send("Bram: I attack")
+
+    assert slept == [ghost.RETRY_AFTER_CAP_S]
+
+
+def test_an_unlabelled_429_is_treated_as_a_burst_limit(tmp_path):
+    """Conservative on purpose: waiting is cheap, ending a session wrongly isn't."""
+    bare = genai_errors.ClientError(429, {"error": {"status": "RESOURCE_EXHAUSTED"}})
+    assert ghost.is_quota_error(bare) is True
+    assert ghost.is_quota_exhausted(bare) is False
+    assert ghost.is_transient(bare) is True
+
+
+@pytest.mark.parametrize("details", [
+    None, "not a dict", {}, {"error": "not a dict"},
+    {"error": {"details": "not a list"}},
+    {"error": {"details": [{"@type": "...QuotaFailure", "violations": "not a list"}]}},
+    {"error": {"details": [{"@type": "...RetryInfo", "retryDelay": "soon"}]}},
+])
+def test_malformed_error_bodies_do_not_raise(details):
+    """A parser that crashes while explaining a failure is worse than none."""
+    exc = genai_errors.ClientError(429, details if isinstance(details, dict) else {})
+    exc.details = details  # whatever google sent, including nothing usable
+
+    assert ghost.quota_violations(exc) == []
+    assert ghost.retry_after(exc) is None
+    assert ghost.is_quota_exhausted(exc) is False
+    ghost.describe(exc)  # must produce a line rather than blow up
+
+
+def test_the_reason_is_stated_in_one_line_not_a_json_dump():
+    """`str(APIError)` is the whole response body; that buries the one word
+    that matters behind a paragraph of quota metadata."""
+    daily = ghost.describe(quota_exceeded(daily=True))
+    burst = ghost.describe(quota_exceeded(daily=False))
+
+    assert daily == "google says daily allowance spent"
+    assert burst == "google says rate limited"
+    assert "@type" not in daily and "\n" not in daily
+
+
+def test_quota_block_names_google_the_limit_and_the_transcript(tmp_path, monkeypatch):
+    """The failure has to read as 'google stopped you', not 'the code broke'."""
+    screen, records = run_cli(
+        tmp_path, monkeypatch, ["Bram: I attack", ""],
+        fail_times=1, error=quota_exceeded(daily=True))
+
+    plain = "".join(line.plain for line in AnsiDecoder().decode(screen))
+    assert "Google is refusing this key" in plain
+    assert "free-tier daily allowance is spent" in plain
+    assert "GenerateRequestsPerDayPerProjectPerModel-FreeTier" in plain
+    assert "usually midnight Pacific" in plain
+    assert ".jsonl" in plain, "it has to name where the play went"
+    assert "[Error during generation" not in plain, "the raw JSON dump is the thing being replaced"
+
+
+def test_quota_block_reassures_that_play_so_far_is_saved(tmp_path, monkeypatch):
+    """Losing forty turns is the fear a quota wall triggers. Answer it outright."""
+    session = ghost.GhostSession(client=FakeClient(), transcript_dir=str(tmp_path))
+    for _ in range(3):
+        session.send("Bram: I attack")
+
+    screen = io.StringIO()
+    monkeypatch.setattr(ghost, "console", Console(width=100, file=screen))
+    ghost.report_quota_block(quota_exceeded(daily=True), session)
+
+    assert "3 turns are already saved" in screen.getvalue()
+    assert "nothing is lost" in screen.getvalue()
+
+
+def test_a_spent_quota_still_leaves_the_session_open(tmp_path, monkeypatch):
+    """History lives only in this process — ending a 40-turn session to wait
+    out a reset throws the conversation away for nothing."""
+    screen, records = run_cli(
+        tmp_path, monkeypatch, ["Bram: I attack", ""],
+        fail_times=1, error=quota_exceeded(daily=True))
+
+    plain = "".join(line.plain for line in AnsiDecoder().decode(screen))
+    assert "Ctrl-D to end the session" in plain
+    # The roster turn died, was offered again, and landed.
+    assert [r["turn"] for r in records] == [1, 2]
 
 
 # ---------------------------------------------------------------------------

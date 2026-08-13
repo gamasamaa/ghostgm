@@ -19,6 +19,35 @@ def overloaded():
     return genai_errors.ServerError(503, {"error": {"message": "overloaded"}})
 
 
+def quota_exceeded(daily=True, retry_delay="27s"):
+    """A free-tier 429, shaped like the one the API actually sends.
+
+    Daily and per-minute exhaustion are the same status code and the same
+    message; only the quotaId separates them, which is the whole reason the
+    classifier has to read this deep. Pass `daily=False` for the burst limit.
+    """
+    period = "PerDay" if daily else "PerMinute"
+    details = [{
+        "@type": "type.googleapis.com/google.rpc.QuotaFailure",
+        "violations": [{
+            "quotaMetric": "generativelanguage.googleapis.com/generate_content_free_tier_requests",
+            "quotaId": f"GenerateRequests{period}PerProjectPerModel-FreeTier",
+            "quotaValue": "50" if daily else "15",
+        }],
+    }]
+    if retry_delay:
+        details.append({
+            "@type": "type.googleapis.com/google.rpc.RetryInfo",
+            "retryDelay": retry_delay,
+        })
+    return genai_errors.ClientError(429, {"error": {
+        "code": 429,
+        "message": "You exceeded your current quota, please check your plan and billing details.",
+        "status": "RESOURCE_EXHAUSTED",
+        "details": details,
+    }})
+
+
 class Usage:
     def __init__(self, prompt=120, candidates=40, total=160):
         self.prompt_token_count = prompt
