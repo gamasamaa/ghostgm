@@ -19,21 +19,28 @@ def overloaded():
     return genai_errors.ServerError(503, {"error": {"message": "overloaded"}})
 
 
-def quota_exceeded(daily=True, retry_delay="27s"):
+def quota_exceeded(daily=True, retry_delay="27s", model="gemini-3.5-flash-lite"):
     """A free-tier 429, shaped like the one the API actually sends.
 
     Daily and per-minute exhaustion are the same status code and the same
     message; only the quotaId separates them, which is the whole reason the
     classifier has to read this deep. Pass `daily=False` for the burst limit.
+
+    `quotaDimensions` carries the model, exactly as the live API sends it. It
+    matters because the daily allowance is per-model and the values differ
+    wildly between them, so "which model" is half the answer.
     """
     period = "PerDay" if daily else "PerMinute"
+    violation = {
+        "quotaMetric": "generativelanguage.googleapis.com/generate_content_free_tier_requests",
+        "quotaId": f"GenerateRequests{period}PerProjectPerModel-FreeTier",
+        "quotaValue": "50" if daily else "15",
+    }
+    if model:
+        violation["quotaDimensions"] = {"location": "global", "model": model}
     details = [{
         "@type": "type.googleapis.com/google.rpc.QuotaFailure",
-        "violations": [{
-            "quotaMetric": "generativelanguage.googleapis.com/generate_content_free_tier_requests",
-            "quotaId": f"GenerateRequests{period}PerProjectPerModel-FreeTier",
-            "quotaValue": "50" if daily else "15",
-        }],
+        "violations": [violation],
     }]
     if retry_delay:
         details.append({
@@ -46,6 +53,17 @@ def quota_exceeded(daily=True, retry_delay="27s"):
         "status": "RESOURCE_EXHAUSTED",
         "details": details,
     }})
+
+
+def refused(code, status, message="refused"):
+    """Any other APIError, by status code.
+
+    ClientError and ServerError split at 500 in the provider's own hierarchy,
+    so the right class is picked here rather than left to the caller.
+    """
+    body = {"error": {"code": code, "status": status, "message": message}}
+    cls = genai_errors.ServerError if code >= 500 else genai_errors.ClientError
+    return cls(code, body)
 
 
 class Usage:

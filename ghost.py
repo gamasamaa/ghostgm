@@ -1,4 +1,5 @@
 import asyncio
+import dataclasses
 import datetime
 import json
 import os
@@ -144,6 +145,203 @@ def is_transient(exc):
     # blip, read timeout. httpx.TransportError covers the family; the builtins
     # catch anything that surfaces before httpx gets involved.
     return isinstance(exc, (httpx.TransportError, ConnectionError, TimeoutError))
+
+
+# ---------------------------------------------------------------------------
+# Explaining a failure
+#
+# `describe` gives the one line a retry notice needs. This is the other half:
+# everything a player needs to decide what to do, pulled out of the response
+# body and handed over as data. Nothing here formats or styles — the renderer
+# owns that, the same way transcript text is only ever styled at print time.
+#
+# The cases are the ones this project has actually hit, not a guess at the API
+# surface. A 503 that reads "google returned 503 UNAVAILABLE" is what sent an
+# afternoon chasing a harness bug that did not exist.
+# ---------------------------------------------------------------------------
+
+# Where google's free-tier daily window rolls over. Confirmed against this
+# project's key: the reset lands on midnight Pacific, not on the caller's date.
+PACIFIC = "America/Los_Angeles"
+
+
+@dataclasses.dataclass(frozen=True)
+class Explanation:
+    """What went wrong, whether waiting helps, and what to do about it.
+
+    `facts` is label/value pairs lifted from the response body — model, quota
+    id, numeric limit — so the renderer can lay them out without re-parsing.
+    """
+    headline: str
+    advice: str
+    retryable: bool
+    wait_s: float = None
+    resets_at: datetime.datetime = None
+    facts: tuple = ()
+
+
+def daily_reset_after(now=None):
+    """Local time of the next midnight Pacific, or None if the tz is unavailable.
+
+    The reset that matters is google's date, not the caller's: at 00:30 AST the
+    local calendar has already turned over while Pacific still has three hours
+    to go, which reads as "a fresh day that is somehow still blocked".
+    """
+    try:
+        from zoneinfo import ZoneInfo
+        pacific = ZoneInfo(PACIFIC)
+    except Exception:
+        return None  # no tz database; the caller just omits the line
+    now = now or datetime.datetime.now().astimezone()
+    there = now.astimezone(pacific)
+    midnight = (there + datetime.timedelta(days=1)).replace(
+        hour=0, minute=0, second=0, microsecond=0)
+    return midnight.astimezone(now.tzinfo)
+
+
+def quota_model(exc):
+    """Which model blew its allowance, if google named one."""
+    for violation in quota_violations(exc):
+        dimensions = violation.get("quotaDimensions")
+        if isinstance(dimensions, dict) and dimensions.get("model"):
+            return str(dimensions["model"])
+    return None
+
+
+def quota_limit(exc):
+    """The numeric allowance google reported, as a string, if it gave one."""
+    for violation in quota_violations(exc):
+        if violation.get("quotaValue"):
+            return str(violation["quotaValue"])
+    return None
+
+
+def _quota_facts(exc):
+    facts = []
+    model = quota_model(exc)
+    if model:
+        facts.append(("model", model))
+    for violation in quota_violations(exc):
+        name = violation.get("quotaId") or violation.get("quotaMetric")
+        if name:
+            facts.append(("quota", str(name)))
+            break
+    limit = quota_limit(exc)
+    if limit:
+        facts.append(("limit", limit))
+    return tuple(facts)
+
+
+def _explain(exc, now):
+    if not isinstance(exc, genai_errors.APIError):
+        if isinstance(exc, (httpx.TransportError, ConnectionError, TimeoutError)):
+            return Explanation(
+                headline="could not reach google",
+                advice="The request never arrived, so nothing was spent. "
+                       "Check the connection and try the turn again.",
+                retryable=True,
+                facts=(("cause", f"{type(exc).__name__}: {exc}"[:120]),))
+        return Explanation(
+            headline=f"unexpected {type(exc).__name__}",
+            advice="This is not a provider error — it most likely comes from "
+                   "this code rather than from google.",
+            retryable=False,
+            facts=(("detail", str(exc)[:200]),))
+
+    code = exc.code
+    asked = retry_after(exc)
+
+    if is_quota_error(exc):
+        if is_quota_exhausted(exc):
+            return Explanation(
+                headline="free-tier daily allowance is spent",
+                advice="Retrying will not clear this. The window reopens on "
+                       "google's clock, not yours.",
+                retryable=False,
+                resets_at=daily_reset_after(now),
+                facts=_quota_facts(exc))
+        return Explanation(
+            headline="rate limited — too many requests too quickly",
+            advice="This clears on its own. Waiting out the window is the fix; "
+                   "the session stays open.",
+            retryable=True,
+            wait_s=asked,
+            facts=_quota_facts(exc))
+
+    if code == 503:
+        return Explanation(
+            headline="the model is overloaded",
+            advice="Google-side demand, not a problem with this key or this "
+                   "code. It usually passes within minutes.",
+            retryable=True,
+            wait_s=asked,
+            facts=(("status", str(exc.status or "UNAVAILABLE")),))
+
+    if code in (500, 502, 504):
+        return Explanation(
+            headline=f"google failed to answer ({code})",
+            advice="A fault on google's side. Re-issuing the same turn is safe.",
+            retryable=True,
+            wait_s=asked)
+
+    if code == 408:
+        return Explanation(
+            headline="the request timed out",
+            advice="No reply arrived in time. Re-issuing the same turn is safe.",
+            retryable=True,
+            wait_s=asked)
+
+    if code == 404:
+        return Explanation(
+            headline="google has no such model for this key",
+            advice=f"Check MODEL in ghost.py (currently {MODEL!r}). Model "
+                   "availability differs between keys and changes over time.",
+            retryable=False)
+
+    if code in (401, 403):
+        return Explanation(
+            headline="google rejected the key",
+            advice="Check GEMINI_API_KEY in .env — missing, mistyped, revoked, "
+                   "or not enabled for this model.",
+            retryable=False)
+
+    if code == 400:
+        return Explanation(
+            headline="google rejected the request as malformed",
+            advice="Retrying sends the identical request and will fail the same "
+                   "way. This is a bug to fix, not a blip to wait out.",
+            retryable=False,
+            facts=(("message", str(_error_body(exc).get("message", ""))[:200]),))
+
+    return Explanation(
+        headline=f"google returned {code} {exc.status or ''}".strip(),
+        advice="Unrecognised refusal. The status above is what google sent.",
+        retryable=code in RETRYABLE_STATUS,
+        wait_s=asked)
+
+
+def explain(exc, now=None):
+    """Everything a player needs to act on a failure, as plain data.
+
+    Never raises. An explainer that dies while explaining leaves the caller with
+    strictly less than it started with, so an unrecognised shape degrades to the
+    exception's own text rather than propagating.
+    """
+    try:
+        return _explain(exc, now)
+    except Exception:
+        # Even the fallback cannot trust the exception: __str__ is caller code
+        # and is free to raise, which would throw from inside the handler that
+        # exists to stop exactly that.
+        try:
+            detail = str(exc)[:200]
+        except Exception:
+            detail = "(the error could not be rendered as text)"
+        return Explanation(
+            headline=f"{type(exc).__name__}",
+            advice="The failure could not be parsed; its own text is below.",
+            retryable=False,
+            facts=(("detail", detail),))
 
 
 def backoff_delay(attempt, rand=random.random):
@@ -438,36 +636,43 @@ def describe(exc):
     return f"{type(exc).__name__}: {exc}"
 
 
-def report_quota_block(exc, session):
-    """Say plainly that google stopped the session, not that the code broke.
+def _reset_line(resets_at, now=None):
+    """The daily reset as a local clock time plus how long that is from now."""
+    now = now or datetime.datetime.now().astimezone()
+    left = max(0, int((resets_at - now).total_seconds()))
+    stamp = resets_at.strftime("%H:%M %Z").strip()
+    return f"{stamp} — midnight Pacific, in {left // 3600}h {left % 3600 // 60:02d}m"
 
-    A spent allowance surfaces as a 429 carrying a wall of JSON. Printed raw it
-    reads like a bug in the session, and the first instinct is to retry — which
-    is exactly wrong for the daily cap. So it gets its own message, and the
-    daily case says outright that waiting is the only fix.
+
+def report_failure(exc, session, now=None):
+    """Say plainly what google did and what to do about it.
+
+    Replaces printing the exception. On a 429 `str(exc)` is a wall of JSON that
+    buries the one word that matters; on a 503 it is a sentence that reads like
+    this code broke. Both send you looking in the wrong place.
+
+    Nothing is decided here — `explain` already did that. This only lays it out.
     """
-    exhausted = is_quota_exhausted(exc)
-    headline = ("free-tier daily allowance is spent" if exhausted
-                else "rate limit did not clear")
-    console.print(Text(f"[Google is refusing this key — {headline}]", style="bold red"))
+    result = explain(exc, now)
+    lead = "Google is refusing this key" if is_quota_error(exc) else "Turn failed"
+    console.print(Text(f"[{lead} — {result.headline}]", style="bold red"))
 
-    for violation in quota_violations(exc):
-        name = violation.get("quotaId") or violation.get("quotaMetric") or "quota"
-        limit = violation.get("quotaValue")
-        console.print(Text(f"  {name}" + (f" = {limit}" if limit else ""), style="dim"))
+    for label, value in result.facts:
+        console.print(Text(f"  {label:<7} {value}", style="dim"))
 
-    if exhausted:
-        console.print(Text(
-            "  Retrying will not clear this. Free-tier daily quotas reset on "
-            "google's clock, not yours — usually midnight Pacific.", style="dim"))
-    else:
-        console.print(Text(
-            f"  {session.max_attempts} attempts, all refused. Either the burst "
-            "limit is still closed or this is a daily cap google didn't label.",
-            style="dim"))
+    if result.resets_at is not None:
+        console.print(Text(f"  {'resets':<7} {_reset_line(result.resets_at, now)}",
+                           style="dim"))
+    elif result.wait_s:
+        console.print(Text(f"  {'wait':<7} google asked for {result.wait_s:.0f}s",
+                           style="dim"))
+
+    console.print(Text(f"  {result.advice}", style="dim"))
 
     # The turn that failed was never committed, so the count is what is on disk.
-    # Losing a long session is the fear a quota wall triggers; answer it here.
+    # Losing a long session is the fear a wall like this triggers; answer it here.
+    if session is None:
+        return
     if session.turn:
         console.print(Text(
             f"  {session.turn} turns are already saved to {session.transcript_path} "
@@ -582,8 +787,12 @@ def main():
             pending = ""
             waiting = retry_after(error)
             waited = f", waiting {waiting:.0f}s as asked" if waiting else ""
+            # `explain`'s headline over `describe`'s: mid-session, "the model is
+            # overloaded" tells you to sit tight, where "google returned 503
+            # UNAVAILABLE" reads like something to go debug.
             console.print(
-                Text(f"\n[retry {attempt}/{session.max_attempts - 1}: {describe(error)}"
+                Text(f"\n[retry {attempt}/{session.max_attempts - 1}: "
+                     f"{explain(error).headline}"
                      f"{waited} — discarding the above, restarting the reply]",
                      style=WARN_STYLE))
             # Same request re-issued, so it is still the same turn number.
@@ -599,17 +808,16 @@ def main():
             console.print()
             # Automated retries are spent (or the failure was never transient),
             # so the last resort is a human deciding to try again.
-            if is_quota_error(e):
-                report_quota_block(e, session)
-            else:
-                console.print(Text(f"[Error during generation: {e}]", style="bold red"))
+            report_failure(e, session)
 
-            # Offered even when the quota is spent: the history only lives in
-            # this process, so ending a 40-turn session to wait out a reset
-            # throws away the conversation. Staying open costs nothing.
-            hint = ("Press Enter to try this turn again, or Ctrl-D to end the session..."
-                    if is_quota_error(e) else
-                    "Press Enter to retry the same turn...")
+            # Offered even when the failure is permanent: the history only lives
+            # in this process, so ending a 40-turn session to wait out a reset
+            # throws away the conversation. Staying open costs nothing. What
+            # changes is the wording — inviting a plain retry after a 404 or a
+            # spent daily cap would be inviting a known-futile keypress.
+            hint = ("Press Enter to retry the same turn..."
+                    if explain(e).retryable else
+                    "Press Enter to try this turn again, or Ctrl-D to end the session...")
             pending_input = user_input  # replay the same turn on the next iteration
             try:
                 console.input(Text(hint, style="dim"))

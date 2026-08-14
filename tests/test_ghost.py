@@ -6,6 +6,7 @@ to produce.
 """
 
 import asyncio
+import datetime
 import io
 import json
 import os
@@ -14,7 +15,7 @@ import sys
 
 import httpx
 import pytest
-from fakes import DEFAULT_CHUNKS, FakeClient, Usage, quota_exceeded
+from fakes import DEFAULT_CHUNKS, FakeClient, Usage, quota_exceeded, refused
 from google.genai import errors as genai_errors
 from rich.ansi import AnsiDecoder
 from rich.console import Console
@@ -299,12 +300,28 @@ def test_quota_block_names_google_the_limit_and_the_transcript(tmp_path, monkeyp
     assert "Google is refusing this key" in plain
     assert "free-tier daily allowance is spent" in plain
     assert "GenerateRequestsPerDayPerProjectPerModel-FreeTier" in plain
-    assert "usually midnight Pacific" in plain
+    assert "midnight Pacific" in plain
     assert ".jsonl" in plain, "it has to name where the play went"
     assert "[Error during generation" not in plain, "the raw JSON dump is the thing being replaced"
 
 
-def test_quota_block_reassures_that_play_so_far_is_saved(tmp_path, monkeypatch):
+def test_the_quota_block_gives_a_clock_time_not_just_a_rule(tmp_path, monkeypatch):
+    """"Resets at midnight Pacific" still needs mental arithmetic at 00:40 in a
+    zone three hours ahead — which is exactly when it gets read."""
+    session = ghost.GhostSession(client=FakeClient(), transcript_dir=str(tmp_path))
+    screen = io.StringIO()
+    monkeypatch.setattr(ghost, "console", Console(width=100, file=screen))
+    now = datetime.datetime(2026, 8, 14, 0, 41, tzinfo=datetime.timezone(
+        datetime.timedelta(hours=-4)))
+
+    ghost.report_failure(quota_exceeded(daily=True), session, now=now)
+
+    out = screen.getvalue()
+    assert "03:00" in out, "the local clock time it comes back"
+    assert "in 2h 19m" in out, "and how long that is from now"
+
+
+def test_the_failure_report_reassures_that_play_so_far_is_saved(tmp_path, monkeypatch):
     """Losing forty turns is the fear a quota wall triggers. Answer it outright."""
     session = ghost.GhostSession(client=FakeClient(), transcript_dir=str(tmp_path))
     for _ in range(3):
@@ -312,10 +329,62 @@ def test_quota_block_reassures_that_play_so_far_is_saved(tmp_path, monkeypatch):
 
     screen = io.StringIO()
     monkeypatch.setattr(ghost, "console", Console(width=100, file=screen))
-    ghost.report_quota_block(quota_exceeded(daily=True), session)
+    ghost.report_failure(quota_exceeded(daily=True), session)
 
     assert "3 turns are already saved" in screen.getvalue()
     assert "nothing is lost" in screen.getvalue()
+
+
+def test_an_overloaded_model_is_not_reported_as_a_key_problem(tmp_path, monkeypatch):
+    """The banner is the first thing read. A 503 wearing 'Google is refusing
+    this key' sends you to the dashboard instead of just waiting."""
+    session = ghost.GhostSession(client=FakeClient(), transcript_dir=str(tmp_path))
+    screen = io.StringIO()
+    monkeypatch.setattr(ghost, "console", Console(width=100, file=screen))
+
+    ghost.report_failure(refused(503, "UNAVAILABLE", "high demand"), session)
+
+    out = screen.getvalue()
+    assert "refusing this key" not in out
+    assert "overloaded" in out
+
+
+def test_a_dead_end_does_not_invite_a_pointless_keypress(tmp_path, monkeypatch):
+    """After a 404 the same turn cannot succeed, so 'press Enter to retry' is a
+    lie. The quota wording — try again or end the session — is the honest one."""
+    screen, _ = run_cli(tmp_path, monkeypatch, ["Bram: I attack", ""],
+                        fail_times=1, error=refused(404, "NOT_FOUND"))
+
+    plain = "".join(line.plain for line in AnsiDecoder().decode(screen))
+    assert "Ctrl-D to end the session" in plain
+    assert "Press Enter to retry the same turn" not in plain
+
+
+def test_a_transient_failure_still_invites_a_plain_retry(tmp_path, monkeypatch):
+    """The mirror of the above: a 503 really might work next time.
+
+    fail_times matches MAX_ATTEMPTS so the automated retries are spent and the
+    human-facing prompt is reached, with the next call succeeding so a
+    transcript still lands. Backoff is flattened — this asserts on wording, and
+    should not spend seven seconds sleeping to do it.
+    """
+    monkeypatch.setattr(ghost, "backoff_delay", lambda *a, **k: 0.0)
+    screen, _ = run_cli(tmp_path, monkeypatch, ["Bram: I attack", ""],
+                        fail_times=ghost.MAX_ATTEMPTS, error=refused(503, "UNAVAILABLE"))
+
+    plain = "".join(line.plain for line in AnsiDecoder().decode(screen))
+    assert "Press Enter to retry the same turn" in plain
+
+
+def test_the_retry_notice_says_what_is_wrong_in_words(tmp_path, monkeypatch):
+    """Mid-stream, "google returned 503 UNAVAILABLE" reads like something to go
+    debug. It is something to sit through."""
+    screen, _ = run_cli(tmp_path, monkeypatch, ["Bram: I attack", ""],
+                        fail_times=1, error=refused(503, "UNAVAILABLE"))
+
+    plain = "".join(line.plain for line in AnsiDecoder().decode(screen))
+    assert "retry 1/" in plain
+    assert "the model is overloaded" in plain
 
 
 def test_a_spent_quota_still_leaves_the_session_open(tmp_path, monkeypatch):
@@ -329,6 +398,160 @@ def test_a_spent_quota_still_leaves_the_session_open(tmp_path, monkeypatch):
     assert "Ctrl-D to end the session" in plain
     # The roster turn died, was offered again, and landed.
     assert [r["turn"] for r in records] == [1, 2]
+
+
+# ---------------------------------------------------------------------------
+# explain(): the failure, as data a player can act on
+#
+# The bar for every case is the same — after reading it, does the player know
+# whether to wait, to fix something, or to stop? A line that only restates the
+# status code fails that bar even when it is accurate.
+# ---------------------------------------------------------------------------
+
+def test_a_spent_daily_allowance_says_waiting_is_the_only_fix():
+    """The one 429 where retrying is exactly the wrong instinct."""
+    result = ghost.explain(quota_exceeded(daily=True))
+
+    assert result.retryable is False
+    assert "daily allowance" in result.headline
+    assert "not clear this" in result.advice
+
+
+def test_a_burst_limit_says_the_opposite():
+    """Same status code, same message, opposite advice — so they must differ."""
+    daily = ghost.explain(quota_exceeded(daily=True))
+    burst = ghost.explain(quota_exceeded(daily=False))
+
+    assert burst.retryable is True and daily.retryable is False
+    assert burst.headline != daily.headline
+    assert burst.wait_s == 27.0, "google's own retryDelay is what to wait"
+
+
+def test_the_quota_explanation_names_the_model_and_the_number():
+    """The daily cap is per-model and the values differ enormously between
+    them — 500 on one, 20 on another. 'Which model, and how many' is the
+    difference between a workable plan and a wasted day."""
+    facts = dict(ghost.explain(quota_exceeded(daily=True, model="gemini-3.7-flash")).facts)
+
+    assert facts["model"] == "gemini-3.7-flash"
+    assert facts["limit"] == "50"
+    assert "PerDay" in facts["quota"]
+
+
+def test_the_daily_reset_is_reported_in_the_callers_own_timezone():
+    """Google's window turns over at midnight Pacific, so a caller east of it
+    can be on tomorrow's date and still blocked. Reporting Pacific time would
+    reproduce exactly that confusion."""
+    from zoneinfo import ZoneInfo
+
+    # 00:41 in Atlantic time on the 14th is still 21:41 Pacific on the 13th.
+    now = datetime.datetime(2026, 8, 14, 0, 41, tzinfo=datetime.timezone(
+        datetime.timedelta(hours=-4)))
+    result = ghost.explain(quota_exceeded(daily=True), now=now)
+
+    assert result.resets_at is not None
+    assert result.resets_at.utcoffset() == now.utcoffset(), "answer in the caller's zone"
+    assert (result.resets_at.hour, result.resets_at.minute) == (3, 0)
+    assert result.resets_at.astimezone(ZoneInfo(ghost.PACIFIC)).hour == 0
+
+
+def test_the_reset_is_the_next_one_not_one_that_already_passed():
+    """Half an hour past midnight Pacific, the answer is tomorrow, not today."""
+    pacific_0030 = datetime.datetime(2026, 8, 14, 0, 30, tzinfo=datetime.timezone(
+        datetime.timedelta(hours=-7)))
+    resets = ghost.daily_reset_after(pacific_0030)
+
+    assert resets > pacific_0030
+    assert (resets - pacific_0030) > datetime.timedelta(hours=23)
+
+
+def test_an_overloaded_model_is_not_blamed_on_the_key():
+    """A 503 during a quota scare reads as 'blocked again' unless it says
+    otherwise. It is google-side load and it passes on its own."""
+    result = ghost.explain(refused(503, "UNAVAILABLE", "high demand"))
+
+    assert result.retryable is True
+    assert "overloaded" in result.headline
+    assert "not a problem with this key" in result.advice
+
+
+def test_an_unknown_model_points_at_the_setting_to_change():
+    result = ghost.explain(refused(404, "NOT_FOUND"))
+
+    assert result.retryable is False
+    assert "MODEL" in result.advice and ghost.MODEL in result.advice
+
+
+def test_a_rejected_key_points_at_the_env_file():
+    for code in (401, 403):
+        result = ghost.explain(refused(code, "UNAUTHENTICATED"))
+        assert result.retryable is False
+        assert "GEMINI_API_KEY" in result.advice
+
+
+def test_a_malformed_request_says_it_is_a_bug_not_a_blip():
+    """400 is the case where waiting is pure waste: the identical retry fails
+    identically."""
+    result = ghost.explain(refused(400, "INVALID_ARGUMENT", "bad contents"))
+
+    assert result.retryable is False
+    assert "bug to fix" in result.advice
+
+
+def test_a_network_failure_says_nothing_was_spent():
+    """Never reaching google means no quota was consumed — worth saying when
+    the player is rationing a daily allowance."""
+    result = ghost.explain(httpx.ConnectError("dns went away"))
+
+    assert result.retryable is True
+    assert "reach google" in result.headline
+    assert "nothing was spent" in result.advice
+
+
+def test_retryability_agrees_with_the_retry_policy():
+    """Two places decide whether to re-issue. If they disagree, one of them is
+    lying to the player."""
+    for exc in [quota_exceeded(daily=True), quota_exceeded(daily=False),
+                refused(503, "UNAVAILABLE"), refused(500, "INTERNAL"),
+                refused(404, "NOT_FOUND"), refused(400, "INVALID_ARGUMENT"),
+                refused(403, "PERMISSION_DENIED"), httpx.ConnectError("x")]:
+        assert ghost.explain(exc).retryable is ghost.is_transient(exc), exc
+
+
+@pytest.mark.parametrize("details", [
+    None, "not a dict", {}, {"error": "not a dict"},
+    {"error": {"details": "not a list"}},
+    {"error": {"details": [{"@type": "...QuotaFailure", "violations": [42]}]}},
+    {"error": {"details": [{"@type": "...QuotaFailure",
+                            "violations": [{"quotaDimensions": "not a dict"}]}]}},
+])
+def test_explaining_a_malformed_body_still_produces_advice(details):
+    """An explainer that dies while explaining leaves the caller with less than
+    it started with."""
+    exc = genai_errors.ClientError(429, details if isinstance(details, dict) else {})
+    exc.details = details
+
+    result = ghost.explain(exc)
+    assert result.headline and result.advice
+
+
+def test_a_failure_that_cannot_be_parsed_still_carries_its_own_text():
+    """The last resort has to be better than silence."""
+    class Hostile(Exception):
+        def __str__(self):
+            raise RuntimeError("even stringifying me fails")
+
+    result = ghost.explain(Hostile())
+    assert result.headline
+    assert result.retryable is False
+
+
+def test_explain_never_styles_anything():
+    """Same rule as the transcript: data here, styling at print time only."""
+    result = ghost.explain(quota_exceeded(daily=True))
+    blob = result.headline + result.advice + "".join(v for _, v in result.facts)
+
+    assert "\x1b[" not in blob and "[bold" not in blob
 
 
 # ---------------------------------------------------------------------------
