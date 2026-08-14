@@ -1,6 +1,10 @@
 # Working roadmap — planning notes, not part of the deliverable
 GHOSTGM_ROADMAP.md
 
+# How to play a baseline session so the sample isn't lopsided. Working notes
+# for the person at the keyboard, same as the roadmap.
+playtest-guide.md
+
 # Environment and API keys
 .env
 .env.*
@@ -12,6 +16,17 @@ GHOSTGM_ROADMAP.md
 # Session Transcripts. Raw play data — the input to phase 2's golden set, which
 # does get committed, under evals/.
 transcripts/
+
+# Playtest arms. Same GM, different player and different reader; kept apart so
+# the three failure logs stay independent samples. Local experiment scaffolding,
+# not part of the deliverable.
+gemini-transcripts/
+gemini-failures.md
+run_ai_session.py
+run_batch_sessions.py
+claude-transcripts/
+claude-failures.md
+run_claude_session.py
 
 # Python / Environment
 venv/
